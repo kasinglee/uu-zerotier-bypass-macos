@@ -1,0 +1,6 @@
+{
+  "local_zerotier_ipv4": "192.0.2.10",
+  "uu_app_path": "/Applications/UURemote.app",
+  "poll_interval_seconds": 0.5,
+  "process_name_prefix": "UURemote"
+}
