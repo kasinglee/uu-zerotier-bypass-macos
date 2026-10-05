@@ -17,6 +17,7 @@ import time
 ANCHOR = 'local.uu-zerotier-isolation'
 ROOT_LINE = f'anchor "{ANCHOR}" quick all'
 ADDRESS = None
+NETWORK = None
 APP_CONTENTS = None
 PROCESS_PREFIX = None
 POLL_INTERVAL = None
@@ -40,11 +41,17 @@ def load_root(rules):
     run(['/sbin/pfctl', '-R', '-f', '-'], rules)
 
 def interface():
+    global NETWORK
+    NETWORK = None
     data = run(['/sbin/ifconfig']).stdout
     for block in re.split(r'(?=^\S[^\n]*: flags=)', data, flags=re.M):
         if re.search(r'\binet ' + re.escape(ADDRESS) + r'\s', block):
             name = block.split(':', 1)[0]
             if re.fullmatch(r'feth\d+', name):
+                mask = re.search(r'\binet ' + re.escape(ADDRESS) + r'\s+netmask (0x[0-9a-fA-F]+|[0-9.]+)', block)
+                if mask:
+                    netmask = str(ipaddress.IPv4Address(int(mask.group(1), 16))) if mask.group(1).startswith('0x') else mask.group(1)
+                    NETWORK = ipaddress.IPv4Network(ADDRESS + '/' + netmask, strict=False)
                 return name
     return None
 
@@ -53,11 +60,24 @@ def is_uu(pid):
     count = PROC.proc_pidpath(pid, buffer, len(buffer))
     return count > 0 and buffer.value.decode(errors='replace').startswith(APP_CONTENTS)
 
+def parse_ipv4_endpoint(text):
+    match = re.fullmatch(r'(\*|[0-9.]+):(\d+)', text)
+    if not match:
+        return None
+    address, port = match.groups()
+    if address != '*':
+        try:
+            address = str(ipaddress.IPv4Address(address))
+        except ipaddress.AddressValueError:
+            return None
+    port = int(port)
+    return (address, port) if 0 < port <= 65535 else None
+
 def ports():
     result = run(['/usr/sbin/lsof', '-nP', '-a', '-c', PROCESS_PREFIX, '-i', '-FpcPnt'], check=False)
     if result.returncode not in (0, 1):
         raise RuntimeError('Cannot inspect UU sockets')
-    found = {'TCP': set(), 'UDP': set()}
+    found = {'TCP': set(), 'UDP': set(), 'remote_endpoints': set()}
     proto = None
     accepted = False
     for line in result.stdout.splitlines():
@@ -68,23 +88,39 @@ def ports():
             proto = None
         elif line.startswith('P'):
             proto = line[1:]
-        elif accepted and line.startswith('n') and proto in found:
-            local = line[1:].split('->', 1)[0]
-            match = re.fullmatch(r'(' + re.escape(ADDRESS) + r'|\*|\[::\]):(\d+)', local)
-            if match:
-                found[proto].add(int(match.group(2)))
+        elif accepted and line.startswith('n') and proto in ('TCP', 'UDP'):
+            parts = line[1:].split('->', 1)
+            local = parse_ipv4_endpoint(parts[0])
+            remote = parse_ipv4_endpoint(parts[1]) if len(parts) == 2 else None
+            remote_is_zt = remote and remote[0] != '*' and NETWORK and ipaddress.IPv4Address(remote[0]) in NETWORK
+            if local and (local[0] in (ADDRESS, '*') or remote_is_zt):
+                found[proto].add(local[1])
+            elif parts[0].startswith('[::]:'):
+                port = parts[0].rsplit(':', 1)[1]
+                if port.isdigit() and 0 < int(port) <= 65535:
+                    found[proto].add(int(port))
+            if remote_is_zt:
+                # A VIF proxy owns a different upstream port. Follow the UU
+                # flow's destination, rather than blocking the proxy process.
+                found['remote_endpoints'].add((proto, remote[0], remote[1]))
     return found
 
 def build_rules(iface, found):
     lines = []
-    if iface:
-        for proto, values in found.items():
+    if iface and NETWORK:
+        for proto in ('TCP', 'UDP'):
+            values = found[proto]
             if values:
                 port_set = '{ ' + ', '.join(map(str, sorted(values))) + ' }'
                 lines.extend([
-                    f'block return in quick on {iface} proto {proto.lower()} from any to any port {port_set}',
-                    f'block return out quick on {iface} proto {proto.lower()} from any port {port_set} to any',
+                    f'block return quick inet proto {proto.lower()} from {NETWORK} to any port {port_set}',
+                    f'block return quick inet proto {proto.lower()} from any port {port_set} to {NETWORK}',
                 ])
+        for proto, address, port in sorted(found.get('remote_endpoints', ())):
+            lines.extend([
+                f'block return quick inet proto {proto.lower()} from any to {address} port {port}',
+                f'block return quick inet proto {proto.lower()} from {address} port {port} to any',
+            ])
     return '\n'.join(lines) + '\n'
 
 def remove_own_anchor():
@@ -168,11 +204,11 @@ def main():
         logging.info('Started')
         while not stop:
             iface = interface()
-            found = ports() if iface else {'TCP': set(), 'UDP': set()}
+            found = ports() if iface else {'TCP': set(), 'UDP': set(), 'remote_endpoints': set()}
             rules = build_rules(iface, found)
             if rules != previous:
                 run(['/sbin/pfctl', '-a', ANCHOR, '-f', '-'], rules)
-                status = {'pid': os.getpid(), 'interface': iface, 'address': ADDRESS,
+                status = {'pid': os.getpid(), 'interface': iface, 'address': ADDRESS, 'network': str(NETWORK),
                           'ports': {key: sorted(value) for key, value in found.items()}, 'updated': time.time()}
                 (STATE / 'current.rules').write_text(rules)
                 (STATE / 'status.json').write_text(json.dumps(status))
